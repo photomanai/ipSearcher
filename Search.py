@@ -8,6 +8,16 @@ import ftplib
 import requests
 import json
 import tempfile
+import socket
+import ssl
+import socket
+from datetime import timezone
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.serialization import (
+    Encoding,
+    PublicFormat,
+)
 
 
 def GetUserInput():
@@ -28,6 +38,15 @@ def GetUserInput():
         default=default_output,
         help=f"Output directory (default: {default_output})",
     )
+    parser.add_argument(
+        "-T",
+        "--speed",
+        type=int,
+        choices=range(0, 6),
+        default=2,
+        metavar="LEVEL",
+        help="Speed level: 0‑5 (default: %(default)s)",
+    )
     args = parser.parse_args()
 
     return {
@@ -35,6 +54,7 @@ def GetUserInput():
         "testMessage": args.test,
         "agressiveMode": args.y,
         "outputDir": args.output,
+        "speed": args.speed,
     }
 
 
@@ -44,7 +64,7 @@ def checkAndInstall():
     print(path)
     if not os.path.exists(path):
         print("[+] Create results dir")
-        os.makedirs("./results")
+        os.makedirs(path)
 
     packages = ["nmap", "dirsearch"]
     download_packages = ["sudo", "apt", "install", "-y"]
@@ -64,13 +84,14 @@ def checkAndInstall():
 
 
 class PortScan:
-    def __init__(self, host, agressiveMode=False, outputDir="./results"):
+    def __init__(self, host, agressiveMode=False, outputDir="./results", speed="2"):
         self.log = "\n\n***************HOST SCAN***************\n\n"
         self.host = host
         self.agressiveMode = agressiveMode
         self.ports = ""
         self.port_services = ""
         self.outputDir = outputDir
+        self.speed = speed
 
     def portScan(self):
 
@@ -87,7 +108,7 @@ class PortScan:
             "sudo",
             "nmap",
             self.host,
-            "-T5",
+            f"-T{self.speed}",
             "-oN",
             path,
             "-vv",
@@ -139,7 +160,7 @@ class PortScan:
             "sudo",
             "nmap",
             self.host,
-            "-T5",
+            f"-T{self.speed}",
             "-A",
             "-oN",
             path,
@@ -176,7 +197,7 @@ class PortScan:
             "sudo",
             "nmap",
             self.host,
-            "-T5",
+            f"-T{self.speed}",
             "-oN",
             path,
             "-vv",
@@ -191,9 +212,14 @@ class PortScan:
             self.log += scan.stderr + "\n"
             print(scan.stderr + "\n")
 
-        services = scan.stdout.split("\n\n")[1]
-        self.log += services + "\n\n"
-        print(services + "\n\n")
+        try:
+            services = scan.stdout.split("\n\n")[1]
+            self.log += services + "\n\n"
+            print(services + "\n\n")
+        except:
+            services = scan.stdout
+            self.log += services + "\n\n"
+            print(services + "\n\n")
 
         pattern = re.compile(r"^(\d+)/(?:tcp|udp)\s+\w+\s+(\S+)", re.MULTILINE)
 
@@ -437,13 +463,178 @@ class Http:
 
 
 class Https(Http):
-    def __init__(self):
-        pass
+    def __init__(
+        self, host, port=443, agressiveMode=False, domain=None, outputDir="./results"
+    ):
+        super().__init__(
+            host,
+            port=int(port),
+            agressiveMode=agressiveMode,
+            domain=domain,
+            outputDir=outputDir,
+        )
+        self.protocol = "https"
+        self.log = "\n***************HTTPS SCAN***************\n"
 
-    def verify_tls(self):
-        pass
+    def pretty_print(self, obj):
+        log_entry = json.dumps(obj, indent=2, ensure_ascii=False)
 
-    # echo | openssl s_client -connect ip:port 2>/dev/null | openssl x509 -noout -text
+        print(log_entry)
+        self.log += log_entry + "\n"
+
+    @staticmethod
+    def cert_to_dict(cert: x509.Certificate) -> dict:
+        def rfc4514(name):
+            try:
+                return name.rfc4514_string()
+            except Exception:
+                return str(name)
+
+        subject = rfc4514(cert.subject)
+        issuer = rfc4514(cert.issuer)
+
+        not_before = cert.not_valid_before
+        not_after = cert.not_valid_after
+
+        san_list = []
+        try:
+            san = cert.extensions.get_extension_for_class(
+                x509.SubjectAlternativeName
+            ).value
+            san_list = san.get_values_for_type(x509.DNSName)
+        except Exception:
+            san_list = []
+
+        fingerprint_sha256 = cert.fingerprint(hashes.SHA256()).hex()
+
+        pub = cert.public_key()
+        try:
+            pub_bytes = pub.public_bytes(
+                Encoding.PEM,
+                PublicFormat.SubjectPublicKeyInfo,
+            )
+            pub_type = pub.__class__.__name__
+        except Exception:
+            pub_bytes = None
+            pub_type = pub.__class__.__name__
+
+        return {
+            "subject": subject,
+            "issuer": issuer,
+            "serial_number": hex(cert.serial_number),
+            "version": (
+                cert.version.name
+                if hasattr(cert.version, "name")
+                else str(cert.version)
+            ),
+            "not_before": not_before.astimezone(timezone.utc).isoformat(),
+            "not_after": not_after.astimezone(timezone.utc).isoformat(),
+            "signature_algorithm": (
+                cert.signature_hash_algorithm.name
+                if cert.signature_hash_algorithm
+                else None
+            ),
+            "san": san_list,
+            "fingerprint_sha256": fingerprint_sha256,
+            "public_key_type": pub_type,
+        }
+
+    def verify_tls(self, timeout: float = 5.0) -> dict:
+        self.log += "\n==========VERIFY TLS==========\n"
+        print("==========VERIFY TLS==========\n")
+        hostname_for_sni = self.domain if self.domain else self.host
+
+        # Strict context for verification
+        verify_ctx = ssl.create_default_context()
+        verify_ctx.check_hostname = True
+        verify_ctx.verify_mode = ssl.CERT_REQUIRED
+
+        der_cert = None
+        cipher_info = None  # Renamed to avoid confusion with the exception block
+        verified = True
+        verification_error = None
+
+        try:
+            # Attempt 1: Strict Verification
+            with socket.create_connection(
+                (self.host, self.port), timeout=timeout
+            ) as sock:
+                with verify_ctx.wrap_socket(
+                    sock, server_hostname=hostname_for_sni
+                ) as ssock:
+                    cipher_info = ssock.cipher()
+                    der_cert = ssock.getpeercert(binary_form=True)
+
+        except ssl.SSLCertVerificationError as e:
+            verified = False
+            verification_error = e.reason
+
+            # Context 2: No Verification, for data retrieval only
+            no_verify_ctx = ssl.create_default_context()
+            no_verify_ctx.check_hostname = False
+            no_verify_ctx.verify_mode = ssl.CERT_NONE
+
+            try:
+                # Attempt 2: Retrieve cert data without verification
+                with socket.create_connection(
+                    (self.host, self.port), timeout=timeout
+                ) as sock:
+                    with no_verify_ctx.wrap_socket(
+                        sock, server_hostname=hostname_for_sni
+                    ) as ssock:
+                        # Success here means we get the cipher and cert
+                        cipher_info = ssock.cipher()
+                        der_cert = ssock.getpeercert(binary_form=True)
+            except Exception as inner_e:
+                # Fatal failure even without verification
+                return {
+                    "host": self.host,
+                    "port": self.port,
+                    "verified_hostname": hostname_for_sni,
+                    "verified": False,
+                    "error": f"Connection failed after verification error: {inner_e}",
+                }
+
+        except Exception as e:
+            # Catch general connection/socket errors
+            return {
+                "host": self.host,
+                "port": self.port,
+                "verified_hostname": hostname_for_sni,
+                "verified": False,
+                "error": str(e),
+            }
+
+        if not der_cert:
+            return {
+                "host": self.host,
+                "port": self.port,
+                "verified_hostname": hostname_for_sni,
+                "verified": False,
+                "error": "Could not retrieve server certificate.",
+            }
+
+        # If we reach here, der_cert and cipher_info have been successfully retrieved
+        cert = x509.load_der_x509_certificate(der_cert)
+
+        result = {
+            "host": self.host,
+            "port": self.port,
+            "verified_hostname": hostname_for_sni,
+            "verified": verified,
+            "cipher": {
+                # Use cipher_info instead of cipher and assume it's a tuple or None
+                "name": cipher_info[0] if cipher_info else None,
+                "protocol": cipher_info[1] if cipher_info else None,
+                "bits": cipher_info[2] if cipher_info else None,
+            },
+            "certificate": self.cert_to_dict(cert),
+        }
+
+        if verification_error:
+            result["verification_error"] = verification_error
+
+        return result
 
 
 class Services:
@@ -457,6 +648,7 @@ class Services:
             self.inputs["host"],
             self.inputs["agressiveMode"],
             outputDir=self.inputs["outputDir"],
+            speed=self.inputs["speed"],
         )
         scan.portScan()
         scan.checkServices()
@@ -485,6 +677,18 @@ class Services:
         http.dirsearch()
         return http.log
 
+    def httpsScan(self, port):
+        print("***************HTTPS SCAN***************\n")
+        https = Https(
+            self.inputs["host"],
+            port=int(port),
+            agressiveMode=self.inputs["agressiveMode"],
+            outputDir=self.inputs["outputDir"],
+        )
+        scan_result = https.verify_tls()
+        https.pretty_print(scan_result)
+        return https.log
+
     def services(self):
         services_log = ""
         try:
@@ -493,7 +697,8 @@ class Services:
             if "http" in self.service_map:
                 services_log += self.httpScan(self.service_map["http"])
             if "https" in self.service_map:
-                pass
+                services_log += self.httpsScan(self.service_map["https"])
+
         except KeyError as e:
             print(f"[-] Error: Service {e} not found in self.services")
             services_log += f"[-] Error: Service {e} not found in self.services\n"
@@ -511,7 +716,10 @@ def main():
     log += port_scan[0]
     services_log = services_scan.services()
     log += services_log
-    with open("results/mainLogs.log", "w") as file:
+    inputs = GetUserInput()
+    outputDir = inputs["outputDir"]
+    path = os.path.join(outputDir, "mainLogs.log")
+    with open(path, "w") as file:
         file.write(log)
 
 
